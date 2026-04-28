@@ -1,9 +1,9 @@
-import sqlite3
-import re
 import os
-from datetime import datetime, timedelta
+import re
+import psycopg2
 import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -11,120 +11,314 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 # --- SOZLAMALAR ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-conn = sqlite3.connect("hisobchi_pro.db", check_same_thread=False)
-c = conn.cursor()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL topilmadi!")
+    if 'localhost' in DATABASE_URL or '127.0.0.1' in DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        user_id INTEGER, 
+        id SERIAL PRIMARY KEY, 
+        user_id BIGINT, 
         type TEXT, 
         amount REAL, 
         category TEXT, 
-        date TEXT)""")
+        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     c.execute("""CREATE TABLE IF NOT EXISTS user_categories (
-        user_id INTEGER, 
+        user_id BIGINT, 
         category_name TEXT, 
         UNIQUE(user_id, category_name))""")
     conn.commit()
+    c.close()
+    conn.close()
 
 init_db()
 
-# --- AI PARSER ---
+# --- FUNKSIYALAR ---
+
 def parse_text(text, user_id):
     text = text.lower()
     amount_match = re.findall(r'\d+', text.replace(',', '').replace(' ', ''))
     if not amount_match: return None
     amount = int(amount_match[0])
     
-    # Kirim kalit so'zlari
     if any(word in text for word in ["kirim", "oldim", "oylik", "+", "tushdi", "daromad"]):
         return ("Kirim", amount, "Daromad")
     
-    # Kategoriya bo'yicha chiqim
-    c.execute("SELECT category_name FROM user_categories WHERE user_id=?", (user_id,))
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
     user_cats = [row[0].lower() for row in c.fetchall()]
+    c.close()
+    conn.close()
+
     for cat in user_cats:
         if cat in text: return ("Chiqim", amount, cat.capitalize())
-    
     return ("Chiqim", amount, "Boshqa")
 
-# --- GRAFIK CHIZISH (BALANS DINAMIKASI) ---
-
-async def send_balance_chart(update, df, title, filename):
+async def send_chart(update, df, title, filename, chart_type='line'):
     if df.empty:
         await update.message.reply_text("Ma'lumot topilmadi.")
         return
 
-    # Sanani tartiblash
-    df['date'] = pd.to_datetime(df['date'], format='mixed')
-    df = df.sort_values('date')
+    plt.figure(figsize=(10, 6))
+    if chart_type == 'line':
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        df['balance'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1).cumsum()
+        plt.plot(df['date'], df['balance'], marker='o', color='#007bff', linewidth=2)
+        plt.fill_between(df['date'], df['balance'], color='#007bff', alpha=0.1)
+        plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
+    elif chart_type == 'pie':
+        cat_sum = df.groupby('category')['amount'].sum()
+        cat_sum.plot(kind='pie', autopct='%1.1f%%', startangle=140, colors=plt.cm.Paired.colors)
+        plt.ylabel('')
 
-    # Kirim/Chiqimni hisobga olgan holda o'zgarishni hisoblash
-    df['change'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1)
-    
-    # Kumulyativ balans (Har bir nuqtadagi umumiy qoldiq)
-    df['balance'] = df['change'].cumsum()
-
-    plt.figure(figsize=(12, 6))
-    
-    # Grafik chizish
-    plt.plot(df['date'], df['balance'], marker='o', linestyle='-', color='#007bff', linewidth=3, markersize=8, label='Balans qoldig\'i')
-    
-    # Grafik ostini bo'yash
-    plt.fill_between(df['date'], df['balance'], color='#007bff', alpha=0.1)
-
-    # Chap tomonda (Y o'qi) pullarni formatlash
-    plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
-    
-    plt.title(title, fontsize=16, fontweight='bold')
-    plt.xlabel("Sana", fontsize=12)
-    plt.ylabel("Umumiy summa (so'm)", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.xticks(rotation=45)
-    
-    # Har bir nuqtaga qiymatni yozib chiqish (ixtiyoriy)
-    for i, txt in enumerate(df['balance']):
-        plt.annotate(f'{int(txt):,}', (df['date'].iloc[i], df['balance'].iloc[i]), 
-                     textcoords="offset points", xytext=(0,10), ha='center', fontsize=9)
-
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(filename, dpi=150)
+    plt.savefig(filename)
     plt.close()
-    
-    await update.message.reply_photo(photo=open(filename, "rb"), caption=f"💰 {title}")
+    await update.message.reply_photo(photo=open(filename, "rb"), caption=f"📊 {title}")
     if os.path.exists(filename): os.remove(filename)
 
-# --- BUYRUQLAR ---
+# --- BUYRUQ HANDLERLARI ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Xush kelibsiz! Harajat yoki kirimni yozing.\nBuyruqlar ro'yxati: /help")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "📜 **Buyruqlar:**\n"
+        "/hisobot - Balans\n"
+        "/kunlik - 10 kunlik grafik\n"
+        "/haftalik - 4 haftalik grafik\n"
+        "/oylik - 1 yillik tahlil\n"
+        "/pie - Kategoriyalar taqsimoti\n"
+        "/categories - Kategoriyalar\n"
+        "/add_cat [nomi] - Yangi kategoriya"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT type, amount FROM transactions WHERE user_id=%s", conn, params=(user_id,))
+    conn.close()
+    if df.empty:
+        await update.message.reply_text("Hali ma'lumot yo'q.")
+        return
+    k = df[df['type']=='Kirim']['amount'].sum()
+    ch = df[df['type']=='Chiqim']['amount'].sum()
+    await update.message.reply_text(f"💰 Kirim: {k:,}\n💸 Chiqim: {ch:,}\n🧾 Qoldiq: {k-ch:,}")
 
 async def kunlik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    # Oxirgi 15 ta tranzaksiyani olish (dinamikani ko'rish uchun)
-    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=? ORDER BY date ASC", conn, params=(user_id,))
-    await send_balance_chart(update, df, "Balans O'zgarishi Grafigi", "balance.png")
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '10 days'", conn, params=(user_id,))
+    conn.close()
+    await send_chart(update, df, "10 Kunlik Dinamika", "daily.png")
+
+async def haftalik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '30 days'", conn, params=(user_id,))
+    conn.close()
+    await send_chart(update, df, "Haftalik Dinamika", "weekly.png")
+
+async def oylik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '1 year'", conn, params=(user_id,))
+    conn.close()
+    await send_chart(update, df, "Yillik Tahlil", "monthly.png")
+
+async def pie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT category, amount FROM transactions WHERE user_id=%s AND type='Chiqim'", conn, params=(user_id,))
+    conn.close()
+    await send_chart(update, df, "Xarajatlar Taqsimoti", "pie.png", chart_type='pie')
+
+async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
+    cats = [r[0] for r in c.fetchall()]
+    conn.close()
+    await update.message.reply_text("📁 Kategoriyalaringiz:\n" + ("\n".join(cats) if cats else "Hali yo'q."))
+
+async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return
+    cat = context.args[0]
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO user_categories VALUES (%s, %s)", (update.message.from_user.id, cat))
+        conn.commit()
+        await update.message.reply_text(f"✅ '{cat}' qo'shildi.")
+    except: await update.message.reply_text("Bu kategoriya allaqachon bor.")
+    finally: conn.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    res = parse_text(update.message.text, update.message.from_user.id)
+    user_id = update.message.from_user.id
+    res = parse_text(update.message.text, user_id)
     if res:
         t, a, cat = res
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO transactions (user_id, type, amount, category, date) VALUES (?,?,?,?,?)", 
-                  (update.message.from_user.id, t, a, cat, now))
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("INSERT INTO transactions (user_id, type, amount, category) VALUES (%s, %s, %s, %s)", (user_id, t, a, cat))
         conn.commit()
-        await update.message.reply_text(f"✅ Saqlandi: {t} {a:,} so'm")
-    else:
-        await update.message.reply_text("Tushunmadim. Masalan: 'Oylik oldim 5,000,000'")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **Xush kelibsiz!**\nKirim va chiqimlarni yozing, men esa sizga balans grafigini chizib beraman.\n\nBuyruq: /kunlik")
+        conn.close()
+        await update.message.reply_text(f"✅ Saqlandi: {t} {a:,} so'm ({cat})")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("hisobot", hisobot))
     app.add_handler(CommandHandler("kunlik", kunlik))
+    app.add_handler(CommandHandler("haftalik", haftalik))
+    app.add_handler(CommandHandler("oylik", oylik))
+    app.add_handler(CommandHandler("pie", pie))
+    app.add_handler(CommandHandler("categories", list_categories))
+    app.add_handler(CommandHandler("add_cat", add_cat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🚀 Bot ishga tushdi...")
     app.run_polling()
+
+# import sqlite3
+# import re
+# import os
+# from datetime import datetime, timedelta
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# from dotenv import load_dotenv
+# from telegram import Update
+# from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# # --- SOZLAMALAR ---
+# load_dotenv()
+# TOKEN = os.getenv("BOT_TOKEN")
+# conn = sqlite3.connect("hisobchi_pro.db", check_same_thread=False)
+# c = conn.cursor()
+
+# def init_db():
+#     c.execute("""CREATE TABLE IF NOT EXISTS transactions (
+#         id INTEGER PRIMARY KEY AUTOINCREMENT, 
+#         user_id INTEGER, 
+#         type TEXT, 
+#         amount REAL, 
+#         category TEXT, 
+#         date TEXT)""")
+#     c.execute("""CREATE TABLE IF NOT EXISTS user_categories (
+#         user_id INTEGER, 
+#         category_name TEXT, 
+#         UNIQUE(user_id, category_name))""")
+#     conn.commit()
+
+# init_db()
+
+# # --- AI PARSER ---
+# def parse_text(text, user_id):
+#     text = text.lower()
+#     amount_match = re.findall(r'\d+', text.replace(',', '').replace(' ', ''))
+#     if not amount_match: return None
+#     amount = int(amount_match[0])
+    
+#     # Kirim kalit so'zlari
+#     if any(word in text for word in ["kirim", "oldim", "oylik", "+", "tushdi", "daromad"]):
+#         return ("Kirim", amount, "Daromad")
+    
+#     # Kategoriya bo'yicha chiqim
+#     c.execute("SELECT category_name FROM user_categories WHERE user_id=?", (user_id,))
+#     user_cats = [row[0].lower() for row in c.fetchall()]
+#     for cat in user_cats:
+#         if cat in text: return ("Chiqim", amount, cat.capitalize())
+    
+#     return ("Chiqim", amount, "Boshqa")
+
+# # --- GRAFIK CHIZISH (BALANS DINAMIKASI) ---
+
+# async def send_balance_chart(update, df, title, filename):
+#     if df.empty:
+#         await update.message.reply_text("Ma'lumot topilmadi.")
+#         return
+
+#     # Sanani tartiblash
+#     df['date'] = pd.to_datetime(df['date'], format='mixed')
+#     df = df.sort_values('date')
+
+#     # Kirim/Chiqimni hisobga olgan holda o'zgarishni hisoblash
+#     df['change'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1)
+    
+#     # Kumulyativ balans (Har bir nuqtadagi umumiy qoldiq)
+#     df['balance'] = df['change'].cumsum()
+
+#     plt.figure(figsize=(12, 6))
+    
+#     # Grafik chizish
+#     plt.plot(df['date'], df['balance'], marker='o', linestyle='-', color='#007bff', linewidth=3, markersize=8, label='Balans qoldig\'i')
+    
+#     # Grafik ostini bo'yash
+#     plt.fill_between(df['date'], df['balance'], color='#007bff', alpha=0.1)
+
+#     # Chap tomonda (Y o'qi) pullarni formatlash
+#     plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
+    
+#     plt.title(title, fontsize=16, fontweight='bold')
+#     plt.xlabel("Sana", fontsize=12)
+#     plt.ylabel("Umumiy summa (so'm)", fontsize=12)
+#     plt.grid(True, linestyle='--', alpha=0.7)
+#     plt.xticks(rotation=45)
+    
+#     # Har bir nuqtaga qiymatni yozib chiqish (ixtiyoriy)
+#     for i, txt in enumerate(df['balance']):
+#         plt.annotate(f'{int(txt):,}', (df['date'].iloc[i], df['balance'].iloc[i]), 
+#                      textcoords="offset points", xytext=(0,10), ha='center', fontsize=9)
+
+#     plt.tight_layout()
+#     plt.savefig(filename, dpi=150)
+#     plt.close()
+    
+#     await update.message.reply_photo(photo=open(filename, "rb"), caption=f"💰 {title}")
+#     if os.path.exists(filename): os.remove(filename)
+
+# # --- BUYRUQLAR ---
+
+# async def kunlik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     # Oxirgi 15 ta tranzaksiyani olish (dinamikani ko'rish uchun)
+#     df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=? ORDER BY date ASC", conn, params=(user_id,))
+#     await send_balance_chart(update, df, "Balans O'zgarishi Grafigi", "balance.png")
+
+# async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     res = parse_text(update.message.text, update.message.from_user.id)
+#     if res:
+#         t, a, cat = res
+#         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#         c.execute("INSERT INTO transactions (user_id, type, amount, category, date) VALUES (?,?,?,?,?)", 
+#                   (update.message.from_user.id, t, a, cat, now))
+#         conn.commit()
+#         await update.message.reply_text(f"✅ Saqlandi: {t} {a:,} so'm")
+#     else:
+#         await update.message.reply_text("Tushunmadim. Masalan: 'Oylik oldim 5,000,000'")
+
+# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     await update.message.reply_text("🤖 **Xush kelibsiz!**\nKirim va chiqimlarni yozing, men esa sizga balans grafigini chizib beraman.\n\nBuyruq: /kunlik")
+
+# if __name__ == "__main__":
+#     app = ApplicationBuilder().token(TOKEN).build()
+#     app.add_handler(CommandHandler("start", start))
+#     app.add_handler(CommandHandler("kunlik", kunlik))
+#     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+#     print("🚀 Bot ishga tushdi...")
+#     app.run_polling()
 
 
     
