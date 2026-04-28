@@ -1,0 +1,2 @@
+# moliyaboshqaruvi
+moliya boshqaruvi
