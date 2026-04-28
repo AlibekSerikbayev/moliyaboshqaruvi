@@ -11,7 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 # --- SOZLAMALAR ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATpostgresql://admin:ke4sEaDybygg1l1gRcbDiVsU3ctKCeAu@dpg-d7o7tk9kh4rs73bkd8v0-a/hisobchi_dbABASE_URL")
+DATABASE_URL = os.getenv("postgresql://admin:ke4sEaDybygg1l1gRcbDiVsU3ctKCeAu@dpg-d7o7tk9kh4rs73bkd8v0-a.oregon-postgres.render.com/hisobchi_db")
 
 def get_db_connection():
     if not DATABASE_URL:
