@@ -1,41 +1,35 @@
-import os
+import sqlite3
 import re
-import psycopg2
+import os
+from datetime import datetime, timedelta
 import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-#uzgarish
+
 # --- SOZLAMALAR ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("postgresql://admin:ke4sEaDybygg1l1gRcbDiVsU3ctKCeAu@dpg-d7o7tk9kh4rs73bkd8v0-a.oregon-postgres.render.com/hisobchi_db")
 
-def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL topilmadi!")
-    if 'localhost' in DATABASE_URL or '127.0.0.1' in DATABASE_URL:
-        return psycopg2.connect(DATABASE_URL)
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+# SQLite ulanishi
+DB_NAME = "hisobchi_pro.db"
 
 def init_db():
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS transactions (
-        id SERIAL PRIMARY KEY, 
-        user_id BIGINT, 
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        user_id INTEGER, 
         type TEXT, 
         amount REAL, 
         category TEXT, 
-        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        date TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS user_categories (
-        user_id BIGINT, 
+        user_id INTEGER, 
         category_name TEXT, 
         UNIQUE(user_id, category_name))""")
     conn.commit()
-    c.close()
     conn.close()
 
 init_db()
@@ -51,11 +45,10 @@ def parse_text(text, user_id):
     if any(word in text for word in ["kirim", "oldim", "oylik", "+", "tushdi", "daromad"]):
         return ("Kirim", amount, "Daromad")
     
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
+    c.execute("SELECT category_name FROM user_categories WHERE user_id=?", (user_id,))
     user_cats = [row[0].lower() for row in c.fetchall()]
-    c.close()
     conn.close()
 
     for cat in user_cats:
@@ -71,7 +64,8 @@ async def send_chart(update, df, title, filename, chart_type='line'):
     if chart_type == 'line':
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
-        df['balance'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1).cumsum()
+        df['change'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1)
+        df['balance'] = df['change'].cumsum()
         plt.plot(df['date'], df['balance'], marker='o', color='#007bff', linewidth=2)
         plt.fill_between(df['date'], df['balance'], color='#007bff', alpha=0.1)
         plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
@@ -87,10 +81,7 @@ async def send_chart(update, df, title, filename, chart_type='line'):
     await update.message.reply_photo(photo=open(filename, "rb"), caption=f"📊 {title}")
     if os.path.exists(filename): os.remove(filename)
 
-# --- BUYRUQ HANDLERLARI ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Xush kelibsiz! Harajat yoki kirimni yozing.\nBuyruqlar ro'yxati: /help")
+# --- BUYRUQLAR ---
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -107,11 +98,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT type, amount FROM transactions WHERE user_id=%s", conn, params=(user_id,))
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("SELECT type, amount FROM transactions WHERE user_id=?", conn, params=(user_id,))
     conn.close()
     if df.empty:
-        await update.message.reply_text("Hali ma'lumot yo'q.")
+        await update.message.reply_text("Ma'lumot yo'q.")
         return
     k = df[df['type']=='Kirim']['amount'].sum()
     ch = df[df['type']=='Chiqim']['amount'].sum()
@@ -119,78 +110,255 @@ async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def kunlik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '10 days'", conn, params=(user_id,))
+    conn = sqlite3.connect(DB_NAME)
+    # Oxirgi 10 kunni hisoblash
+    date_limit = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=? AND date >= ?", conn, params=(user_id, date_limit))
     conn.close()
     await send_chart(update, df, "10 Kunlik Dinamika", "daily.png")
 
-async def haftalik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '30 days'", conn, params=(user_id,))
-    conn.close()
-    await send_chart(update, df, "Haftalik Dinamika", "weekly.png")
-
-async def oylik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '1 year'", conn, params=(user_id,))
-    conn.close()
-    await send_chart(update, df, "Yillik Tahlil", "monthly.png")
-
 async def pie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT category, amount FROM transactions WHERE user_id=%s AND type='Chiqim'", conn, params=(user_id,))
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("SELECT category, amount FROM transactions WHERE user_id=? AND type='Chiqim'", conn, params=(user_id,))
     conn.close()
     await send_chart(update, df, "Xarajatlar Taqsimoti", "pie.png", chart_type='pie')
 
-async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
-    cats = [r[0] for r in c.fetchall()]
-    conn.close()
-    await update.message.reply_text("📁 Kategoriyalaringiz:\n" + ("\n".join(cats) if cats else "Hali yo'q."))
-
 async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return
+    if not context.args:
+        await update.message.reply_text("Kategoriya nomini yozing. Masalan: /add_cat Taksi")
+        return
     cat = context.args[0]
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO user_categories VALUES (%s, %s)", (update.message.from_user.id, cat))
+        c.execute("INSERT INTO user_categories VALUES (?, ?)", (update.message.from_user.id, cat))
         conn.commit()
-        await update.message.reply_text(f"✅ '{cat}' qo'shildi.")
-    except: await update.message.reply_text("Bu kategoriya allaqachon bor.")
-    finally: conn.close()
+        await update.message.reply_text(f"✅ '{cat}' kategoriyasi qo'shildi.")
+    except:
+        await update.message.reply_text("Bu kategoriya allaqachon mavjud.")
+    finally:
+        conn.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     res = parse_text(update.message.text, user_id)
     if res:
         t, a, cat = res
-        conn = get_db_connection()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("INSERT INTO transactions (user_id, type, amount, category) VALUES (%s, %s, %s, %s)", (user_id, t, a, cat))
+        c.execute("INSERT INTO transactions (user_id, type, amount, category, date) VALUES (?, ?, ?, ?, ?)", 
+                  (user_id, t, a, cat, now))
         conn.commit()
         conn.close()
         await update.message.reply_text(f"✅ Saqlandi: {t} {a:,} so'm ({cat})")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", help_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("hisobot", hisobot))
     app.add_handler(CommandHandler("kunlik", kunlik))
-    app.add_handler(CommandHandler("haftalik", haftalik))
-    app.add_handler(CommandHandler("oylik", oylik))
     app.add_handler(CommandHandler("pie", pie))
-    app.add_handler(CommandHandler("categories", list_categories))
     app.add_handler(CommandHandler("add_cat", add_cat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("🚀 SQLite Bot ishga tushdi...")
     app.run_polling()
+
+# import os
+# import re
+# import psycopg2
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# from datetime import datetime, timedelta
+# from dotenv import load_dotenv
+# from telegram import Update
+# from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+# #uzgarish
+# # --- SOZLAMALAR ---
+# load_dotenv()
+# TOKEN = os.getenv("BOT_TOKEN")
+# DATABASE_URL = os.getenv("postgresql://admin:ke4sEaDybygg1l1gRcbDiVsU3ctKCeAu@dpg-d7o7tk9kh4rs73bkd8v0-a.oregon-postgres.render.com/hisobchi_db")
+
+# def get_db_connection():
+#     if not DATABASE_URL:
+#         raise ValueError("DATABASE_URL topilmadi!")
+#     if 'localhost' in DATABASE_URL or '127.0.0.1' in DATABASE_URL:
+#         return psycopg2.connect(DATABASE_URL)
+#     return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+# def init_db():
+#     conn = get_db_connection()
+#     c = conn.cursor()
+#     c.execute("""CREATE TABLE IF NOT EXISTS transactions (
+#         id SERIAL PRIMARY KEY, 
+#         user_id BIGINT, 
+#         type TEXT, 
+#         amount REAL, 
+#         category TEXT, 
+#         date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+#     c.execute("""CREATE TABLE IF NOT EXISTS user_categories (
+#         user_id BIGINT, 
+#         category_name TEXT, 
+#         UNIQUE(user_id, category_name))""")
+#     conn.commit()
+#     c.close()
+#     conn.close()
+
+# init_db()
+
+# # --- FUNKSIYALAR ---
+
+# def parse_text(text, user_id):
+#     text = text.lower()
+#     amount_match = re.findall(r'\d+', text.replace(',', '').replace(' ', ''))
+#     if not amount_match: return None
+#     amount = int(amount_match[0])
+    
+#     if any(word in text for word in ["kirim", "oldim", "oylik", "+", "tushdi", "daromad"]):
+#         return ("Kirim", amount, "Daromad")
+    
+#     conn = get_db_connection()
+#     c = conn.cursor()
+#     c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
+#     user_cats = [row[0].lower() for row in c.fetchall()]
+#     c.close()
+#     conn.close()
+
+#     for cat in user_cats:
+#         if cat in text: return ("Chiqim", amount, cat.capitalize())
+#     return ("Chiqim", amount, "Boshqa")
+
+# async def send_chart(update, df, title, filename, chart_type='line'):
+#     if df.empty:
+#         await update.message.reply_text("Ma'lumot topilmadi.")
+#         return
+
+#     plt.figure(figsize=(10, 6))
+#     if chart_type == 'line':
+#         df['date'] = pd.to_datetime(df['date'])
+#         df = df.sort_values('date')
+#         df['balance'] = df.apply(lambda x: x['amount'] if x['type'] == 'Kirim' else -x['amount'], axis=1).cumsum()
+#         plt.plot(df['date'], df['balance'], marker='o', color='#007bff', linewidth=2)
+#         plt.fill_between(df['date'], df['balance'], color='#007bff', alpha=0.1)
+#         plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
+#     elif chart_type == 'pie':
+#         cat_sum = df.groupby('category')['amount'].sum()
+#         cat_sum.plot(kind='pie', autopct='%1.1f%%', startangle=140, colors=plt.cm.Paired.colors)
+#         plt.ylabel('')
+
+#     plt.title(title)
+#     plt.tight_layout()
+#     plt.savefig(filename)
+#     plt.close()
+#     await update.message.reply_photo(photo=open(filename, "rb"), caption=f"📊 {title}")
+#     if os.path.exists(filename): os.remove(filename)
+
+# # --- BUYRUQ HANDLERLARI ---
+
+# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     await update.message.reply_text("🤖 Xush kelibsiz! Harajat yoki kirimni yozing.\nBuyruqlar ro'yxati: /help")
+
+# async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     msg = (
+#         "📜 **Buyruqlar:**\n"
+#         "/hisobot - Balans\n"
+#         "/kunlik - 10 kunlik grafik\n"
+#         "/haftalik - 4 haftalik grafik\n"
+#         "/oylik - 1 yillik tahlil\n"
+#         "/pie - Kategoriyalar taqsimoti\n"
+#         "/categories - Kategoriyalar\n"
+#         "/add_cat [nomi] - Yangi kategoriya"
+#     )
+#     await update.message.reply_text(msg, parse_mode="Markdown")
+
+# async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     df = pd.read_sql_query("SELECT type, amount FROM transactions WHERE user_id=%s", conn, params=(user_id,))
+#     conn.close()
+#     if df.empty:
+#         await update.message.reply_text("Hali ma'lumot yo'q.")
+#         return
+#     k = df[df['type']=='Kirim']['amount'].sum()
+#     ch = df[df['type']=='Chiqim']['amount'].sum()
+#     await update.message.reply_text(f"💰 Kirim: {k:,}\n💸 Chiqim: {ch:,}\n🧾 Qoldiq: {k-ch:,}")
+
+# async def kunlik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '10 days'", conn, params=(user_id,))
+#     conn.close()
+#     await send_chart(update, df, "10 Kunlik Dinamika", "daily.png")
+
+# async def haftalik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '30 days'", conn, params=(user_id,))
+#     conn.close()
+#     await send_chart(update, df, "Haftalik Dinamika", "weekly.png")
+
+# async def oylik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     df = pd.read_sql_query("SELECT date, type, amount FROM transactions WHERE user_id=%s AND date > NOW() - INTERVAL '1 year'", conn, params=(user_id,))
+#     conn.close()
+#     await send_chart(update, df, "Yillik Tahlil", "monthly.png")
+
+# async def pie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     df = pd.read_sql_query("SELECT category, amount FROM transactions WHERE user_id=%s AND type='Chiqim'", conn, params=(user_id,))
+#     conn.close()
+#     await send_chart(update, df, "Xarajatlar Taqsimoti", "pie.png", chart_type='pie')
+
+# async def list_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     conn = get_db_connection()
+#     c = conn.cursor()
+#     c.execute("SELECT category_name FROM user_categories WHERE user_id=%s", (user_id,))
+#     cats = [r[0] for r in c.fetchall()]
+#     conn.close()
+#     await update.message.reply_text("📁 Kategoriyalaringiz:\n" + ("\n".join(cats) if cats else "Hali yo'q."))
+
+# async def add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not context.args: return
+#     cat = context.args[0]
+#     conn = get_db_connection()
+#     c = conn.cursor()
+#     try:
+#         c.execute("INSERT INTO user_categories VALUES (%s, %s)", (update.message.from_user.id, cat))
+#         conn.commit()
+#         await update.message.reply_text(f"✅ '{cat}' qo'shildi.")
+#     except: await update.message.reply_text("Bu kategoriya allaqachon bor.")
+#     finally: conn.close()
+
+# async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     user_id = update.message.from_user.id
+#     res = parse_text(update.message.text, user_id)
+#     if res:
+#         t, a, cat = res
+#         conn = get_db_connection()
+#         c = conn.cursor()
+#         c.execute("INSERT INTO transactions (user_id, type, amount, category) VALUES (%s, %s, %s, %s)", (user_id, t, a, cat))
+#         conn.commit()
+#         conn.close()
+#         await update.message.reply_text(f"✅ Saqlandi: {t} {a:,} so'm ({cat})")
+
+# if __name__ == "__main__":
+#     app = ApplicationBuilder().token(TOKEN).build()
+#     app.add_handler(CommandHandler("start", start))
+#     app.add_handler(CommandHandler("help", help_command))
+#     app.add_handler(CommandHandler("hisobot", hisobot))
+#     app.add_handler(CommandHandler("kunlik", kunlik))
+#     app.add_handler(CommandHandler("haftalik", haftalik))
+#     app.add_handler(CommandHandler("oylik", oylik))
+#     app.add_handler(CommandHandler("pie", pie))
+#     app.add_handler(CommandHandler("categories", list_categories))
+#     app.add_handler(CommandHandler("add_cat", add_cat))
+#     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+#     app.run_polling()
 
 # import sqlite3
 # import re
