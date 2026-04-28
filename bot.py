@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
+#uzgarish
 # --- SOZLAMALAR ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
